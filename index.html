@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>Terran vs Zerg: Attack Visible (Fixed)</title>
+  <style>
+    body { margin: 0; background: #05080a; color: #00ff00; font-family: 'Courier New', monospace; overflow: hidden; }
+    #res-bar { position: absolute; top: 0; left:0; width: 100%; height: 40px; background: rgba(0,0,0,0.9); display: flex; align-items: center; justify-content: space-around; border-bottom: 2px solid #444; z-index: 10; }
+    .res-item { font-size: 15px; font-weight: bold; }
+    .min { color: #50bcdf; } .gas { color: #2ecc71; }
+    #ui-panel { position: absolute; bottom: 0; left:0; width: 100%; height: 160px; background: #151a1e; border-top: 3px solid #00ff00; display: flex; padding: 10px; box-sizing: border-box; z-index: 10; }
+    .info { width: 220px; border-right: 1px solid #333; }
+    .actions { flex-grow: 1; display: grid; grid-template-columns: repeat(6, 1fr); gap: 5px; padding-left: 10px; }
+    button { background: #222; color: #00ff00; border: 1px solid #00ff00; cursor: pointer; font-size: 10px; padding: 5px; }
+    button:hover:not(:disabled) { background: #00ff00; color: #000; }
+    button:disabled { border-color: #333; color: #444; }
+    #msg { position: absolute; top: 50px; left: 50%; transform: translateX(-50%); color: #ff4444; font-weight: bold; z-index: 11; }
+
+    /* ✅ 캔버스를 UI 바(40px) 아래로 고정 */
+    canvas { position:absolute; top:40px; left:0; display:block; z-index: 1; }
+  </style>
+</head>
+<body>
+
+<div id="res-bar">
+  <div class="res-item">PLAYER (TERRAN)
+    <span class="min">M: <span id="p-min">400</span></span>
+    <span class="gas">G: <span id="p-gas">0</span></span>
+  </div>
+  <div id="msg">⏱ 빌드 단계: 30초 동안 저그 공격 없음</div>
+  <div class="res-item" style="color:#ff3333">ENEMY AI (ZERG)</div>
+</div>
+
+<div id="ui-panel">
+  <div class="info">
+    <h3 id="sel-name" style="margin:0;">UNIT READY</h3>
+    <p id="sel-hp" style="font-size: 12px; color: #ff3333; margin: 5px 0;"></p>
+    <p id="sel-status" style="font-size: 11px; color: #aaa;"></p>
+  </div>
+  <div class="actions" id="action-buttons"></div>
+</div>
+
+<canvas id="gameCanvas"></canvas>
+
+<script>
+/* =========================
+   Canvas / Layout
+========================= */
+const TOP_UI = 40;
+const BOTTOM_UI = 160;
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+function resize(){
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight - TOP_UI - BOTTOM_UI;
+}
+resize();
+window.addEventListener('resize', resize);
+
+/* =========================
+   Game State
+========================= */
+let pRes = { min: 400, gas: 0 };
+let eRes = { min: 400, gas: 0 };
+let objects = [];
+let projectiles = [];
+let selectedObj = null;
+
+// ✅ 30초 공격 제한 타이머
+const gameStartTime = performance.now();
+let combatEnabled = false;
+
+const DATA = {
+  // Terran(플레이어)
+  COMMAND: { name: 'Command Center', hp: 1500, size: 45, cost: [400, 0], color: '#3366ff' },
+  BARRACKS: { name: 'Barracks', hp: 1000, size: 40, cost: [150, 0], color: '#7f8c8d' },
+  ACADEMY: { name: 'Academy', hp: 600, size: 30, cost: [150, 0], color: '#9b59b6', req: 'BARRACKS' },
+  FACTORY: { name: 'Factory', hp: 1250, size: 40, cost: [200, 100], color: '#e67e22', req: 'BARRACKS' },
+  STARPORT: { name: 'Starport', hp: 1300, size: 40, cost: [150, 100], color: '#1abc9c', req: 'FACTORY' },
+
+  SCV: { name: 'SCV', hp: 60, size: 7, cost: [50, 0], speed: 2.2, isWorker:true },
+  MARINE: { name: 'Marine', hp: 40, size: 7, cost: [50, 0], speed: 1.8, atk: 6, range: 110, cd: 28, projSpeed: 7 },
+  FIREBAT: { name: 'Firebat', hp: 50, size: 8, cost: [50, 25], speed: 1.8, req: 'ACADEMY', atk: 10, range: 55, cd: 36, projSpeed: 6 },
+  MEDIC: { name: 'Medic', hp: 60, size: 7, cost: [50, 25], speed: 1.8, req: 'ACADEMY' },
+  SIEGE_TANK: { name: 'Siege Tank', hp: 150, size: 12, cost: [150, 100], speed: 1.5, req: 'FACTORY', atk: 22, range: 170, cd: 60, projSpeed: 6 },
+  BATTLECRUISER: { name: 'Battlecruiser', hp: 500, size: 18, cost: [400, 300], speed: 1.0, req: 'STARPORT', atk: 14, range: 160, cd: 40, projSpeed: 5 },
+
+  // Zerg(적 AI)
+  HATCHERY: { name: 'Hatchery', hp: 1400, size: 45, cost: [400, 0], color: '#7a1f1f' },
+  DRONE: { name: 'Drone', hp: 40, size: 7, cost: [50, 0], speed: 2.3, isWorker:true },
+  ZERGLING: { name: 'Zergling', hp: 35, size: 7, cost: [50, 0], speed: 2.4, atk: 5, range: 22, cd: 18, melee:true },
+  HYDRALISK: { name: 'Hydralisk', hp: 80, size: 9, cost: [100, 50], speed: 1.7, atk: 10, range: 120, cd: 30, projSpeed: 6 },
+  MUTALISK: { name: 'Mutalisk', hp: 120, size: 11, cost: [150, 100], speed: 2.0, atk: 9, range: 135, cd: 34, projSpeed: 6 }
+};
+
+function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+function rand(a,b){ return Math.random()*(b-a)+a; }
+
+class GameObject {
+  constructor(x, y, typeKey, team) {
+    this.x = x; this.y = y;
+    this.typeKey = typeKey;
+    this.team = team;
+    this.data = DATA[typeKey];
+    this.hp = this.data.hp;
+
+    this.targetX = x; this.targetY = y;
+    this.status = 'idle';
+
+    // worker cargo
+    this.cargo = 0;
+    this.cargoType = 'min';
+
+    // combat
+    this.attackTarget = null;
+    this.cooldown = 0;
+
+    // hit flash
+    this.hitFlash = 0;
+  }
+
+  isAlive(){ return this.hp > 0; }
+  isCombatUnit(){ return !!this.data.atk; }
+
+  update() {
+    if (!this.isAlive()) return;
+
+    // ✅ 건물은 이동/분리 로직 차단 (흔들림 방지)
+    if (this.data.size > 20) {
+      if (this.hitFlash > 0) this.hitFlash--;
+      return;
+    }
+
+    if (this.hitFlash > 0) this.hitFlash--;
+
+    // 워커는 별도 로직
+    if (this.typeKey === 'SCV' || this.typeKey === 'DRONE') {
+      this.updateWorker();
+      return;
+    }
+
+    // ✅ 30초 전: 적 전투유닛은 정지/비전투
+    if (this.team === 'enemy' && !combatEnabled) return;
+
+    if (this.team === 'enemy') {
+      // 적은 항상 공격(전투 가능 시점 이후)
+      this.status = 'attacking';
+      this.autoCombat();
+      this.separate();
+      return;
+    }
+
+    // =========================
+    // ✅ 플레이어 유닛 업데이트(핵심 수정)
+    // - attacking 중에는 targetX/Y 이동을 절대 하지 않음
+    // - moving 일 때만 targetX/Y 이동
+    // =========================
+    if (this.status === 'attacking') {
+      this.autoCombat();
+    } else if (this.status === 'moving') {
+      this.moveTo(this.targetX, this.targetY);
+      // 도착하면 idle
+      if (this.distTo(this.targetX, this.targetY) < 6) {
+        this.status = 'idle';
+      }
+    } else {
+      // idle이면 아무 것도 안 함 (원하면 미세 이동/정렬 가능)
+    }
+
+    this.separate();
+  }
+
+  updateWorker() {
+    const isPlayer = this.team === 'player';
+
+    const mPos = isPlayer ? {x: 80, y: 80} : {x: canvas.width-80, y: canvas.height-80};
+    const gPos = isPlayer ? {x: 80, y: 350} : {x: canvas.width-80, y: canvas.height-350};
+
+    const baseKey = isPlayer ? 'COMMAND' : 'HATCHERY';
+    const base = objects.find(o => o.typeKey === baseKey && o.team === this.team);
+
+    if (this.status !== 'mining' && this.status !== 'gassing' && this.status !== 'returning') {
+      this.status = 'mining';
+    }
+
+    if (this.cargo === 0) {
+      let dest = this.status === 'gassing' ? gPos : mPos;
+      this.moveTo(dest.x, dest.y);
+
+      if (this.distTo(dest.x, dest.y) < 15) {
+        this.cargo = 8;
+        this.cargoType = (this.status === 'gassing') ? 'gas' : 'min';
+        this.status = 'returning';
+      }
+    } else if (base) {
+      this.moveTo(base.x, base.y);
+      if (this.distTo(base.x, base.y) < 30) {
+        if (isPlayer) { pRes[this.cargoType] += this.cargo; updateUI(); }
+        else { eRes[this.cargoType] += this.cargo; }
+
+        this.cargo = 0;
+        this.status = (this.cargoType === 'gas') ? 'gassing' : 'mining';
+      }
+    }
+
+    this.separate();
+  }
+
+  autoCombat() {
+    if (!this.isCombatUnit()) return;
+
+    // 타겟 유효성 체크
+    if (!this.attackTarget || !this.attackTarget.isAlive() || this.attackTarget.team === this.team) {
+      this.attackTarget = this.findNearestEnemyInVision(9999);
+    }
+    if (!this.attackTarget) return;
+
+    const r = this.data.range || 0;
+    const d = this.distTo(this.attackTarget.x, this.attackTarget.y);
+
+    if (this.cooldown > 0) this.cooldown--;
+
+    // 사거리 밖이면 "타겟으로 이동"
+    if (d > r) {
+      this.moveTo(this.attackTarget.x, this.attackTarget.y);
+      return;
+    }
+
+    // 사거리 안이면 공격
+    if (this.cooldown === 0) {
+      this.doAttack(this.attackTarget);
+      this.cooldown = this.data.cd || 30;
+    }
+  }
+
+  doAttack(target) {
+    const atk = this.data.atk || 0;
+
+    if (this.data.melee) {
+      target.takeDamage(atk);
+      spawnHitEffect(target.x, target.y, this.team);
+      return;
+    }
+
+    projectiles.push({
+      x: this.x, y: this.y,
+      tx: target,
+      team: this.team,
+      speed: this.data.projSpeed || 6,
+      dmg: atk,
+      kind: (this.team === 'player') ? 'bullet' : 'spike'
+    });
+  }
+
+  takeDamage(dmg) {
+    this.hp -= dmg;
+    this.hitFlash = 6;
+    if (this.hp <= 0) this.hp = 0;
+    if (selectedObj === this) updateUI();
+  }
+
+  findNearestEnemyInVision(maxDist) {
+    let best = null;
+    let bestD = maxDist;
+    for (const o of objects) {
+      if (!o.isAlive()) continue;
+      if (o.team === this.team) continue;
+      const d = this.distTo(o.x, o.y);
+      if (d < bestD) { bestD = d; best = o; }
+    }
+    return best;
+  }
+
+  moveTo(tx, ty) {
+    const sp = this.data.speed || 0;
+    if (!sp) return;
+    let dx = tx - this.x, dy = ty - this.y;
+    let d = Math.hypot(dx, dy);
+    if (d > 2) {
+      this.x += (dx/d) * sp;
+      this.y += (dy/d) * sp;
+    }
+    this.x = clamp(this.x, 10, canvas.width-10);
+    this.y = clamp(this.y, 10, canvas.height-10);
+  }
+
+  distTo(tx, ty) { return Math.hypot(this.x-tx, this.y-ty); }
+
+  separate() {
+    for (const o of objects) {
+      if (o === this || !o.isAlive()) continue;
+
+      const minD = (this.data.size + o.data.size) * 0.8;
+      const dx = this.x - o.x, dy = this.y - o.y;
+      const d = Math.hypot(dx, dy);
+
+      if (d > 0 && d < minD) {
+        const push = (minD - d) * 0.03;
+        this.x += (dx / d) * push;
+        this.y += (dy / d) * push;
+      }
+    }
+  }
+
+  draw() {
+    const isTerran = (this.team === 'player');
+
+    if (isTerran) {
+      if (this.data.size > 20) {
+        ctx.fillStyle = this.hitFlash ? "#ffffff" : (this.data.color || '#3366ff');
+        ctx.fillRect(this.x - this.data.size/2, this.y - this.data.size/2, this.data.size, this.data.size);
+        ctx.strokeStyle = "rgba(255,255,255,0.9)";
+        ctx.strokeRect(this.x - this.data.size/2, this.y - this.data.size/2, this.data.size, this.data.size);
+      } else {
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.data.size, 0, Math.PI*2);
+        ctx.fillStyle = this.hitFlash ? "#ffffff" : "#2f79ff";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(255,255,255,0.9)";
+        ctx.stroke();
+      }
+    } else {
+      if (this.data.size > 20) {
+        ctx.beginPath();
+        ctx.ellipse(this.x, this.y, this.data.size*0.65, this.data.size*0.52, 0, 0, Math.PI*2);
+        ctx.fillStyle = this.hitFlash ? "#ffffff" : "#7a1f1f";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(255,180,180,0.7)";
+        ctx.stroke();
+
+        ctx.strokeStyle = "rgba(255,120,120,0.6)";
+        for (let i=0;i<6;i++){
+          const a = i*(Math.PI*2/6);
+          ctx.beginPath();
+          ctx.moveTo(this.x, this.y);
+          ctx.lineTo(this.x + Math.cos(a)*this.data.size*0.8, this.y + Math.sin(a)*this.data.size*0.55);
+          ctx.stroke();
+        }
+      } else {
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.data.size, 0, Math.PI*2);
+        ctx.fillStyle = this.hitFlash ? "#ffffff" : "#ff3b3b";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(255,220,220,0.9)";
+        ctx.stroke();
+
+        ctx.strokeStyle = "rgba(255,180,180,0.8)";
+        ctx.beginPath();
+        ctx.moveTo(this.x, this.y);
+        ctx.lineTo(this.x + this.data.size*1.8, this.y - this.data.size*0.6);
+        ctx.stroke();
+      }
+    }
+
+    drawHpBar(this);
+
+    if (selectedObj === this) {
+      ctx.strokeStyle = '#00ff00';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(this.x - this.data.size/2 - 6, this.y - this.data.size/2 - 6, this.data.size + 12, this.data.size + 12);
+      ctx.lineWidth = 1;
+    }
+
+    // 공격 대상 라인 표시
+    if (this.isCombatUnit() && this.status === 'attacking' && this.attackTarget && this.attackTarget.isAlive()) {
+      ctx.strokeStyle = (this.team === 'player') ? "rgba(120,180,255,0.25)" : "rgba(255,120,120,0.25)";
+      ctx.beginPath();
+      ctx.moveTo(this.x, this.y);
+      ctx.lineTo(this.attackTarget.x, this.attackTarget.y);
+      ctx.stroke();
+    }
+  }
+}
+
+function drawHpBar(o){
+  const w = Math.max(26, o.data.size*1.6);
+  const h = 4;
+  const ratio = o.hp / o.data.hp;
+  const x = o.x - w/2;
+  const y = o.y - o.data.size - 10;
+
+  ctx.fillStyle = "rgba(0,0,0,0.6)";
+  ctx.fillRect(x-1, y-1, w+2, h+2);
+
+  ctx.fillStyle = (o.team === 'player') ? "#2bd576" : "#ff6b6b";
+  ctx.fillRect(x, y, w*ratio, h);
+
+  ctx.fillStyle = "rgba(255,255,255,0.12)";
+  ctx.fillRect(x + w*ratio, y, w*(1-ratio), h);
+}
+
+function spawnHitEffect(x,y,team){
+  projectiles.push({ x, y, tx:null, team, speed:0, dmg:0, kind:"hit", life:8 });
+}
+
+function updateProjectiles(){
+  for (let i=projectiles.length-1;i>=0;i--){
+    const p = projectiles[i];
+
+    if (p.kind === "hit") {
+      p.life--;
+      if (p.life <= 0) projectiles.splice(i,1);
+      continue;
+    }
+
+    const target = p.tx;
+    if (!target || !target.isAlive()) {
+      projectiles.splice(i,1);
+      continue;
+    }
+
+    const dx = target.x - p.x, dy = target.y - p.y;
+    const d = Math.hypot(dx, dy);
+
+    if (d < 10) {
+      target.takeDamage(p.dmg);
+      spawnHitEffect(target.x, target.y, p.team);
+      projectiles.splice(i,1);
+      continue;
+    }
+
+    p.x += (dx/d) * p.speed;
+    p.y += (dy/d) * p.speed;
+  }
+}
+
+function drawProjectiles(){
+  for (const p of projectiles){
+    if (p.kind === "hit") {
+      ctx.fillStyle = "rgba(255,255,255,0.35)";
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 10 - p.life, 0, Math.PI*2);
+      ctx.fill();
+      continue;
+    }
+
+    if (p.kind === "bullet") {
+      ctx.strokeStyle = "rgba(160,220,255,0.9)";
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x - 8, p.y);
+      ctx.stroke();
+    } else if (p.kind === "spike") {
+      ctx.strokeStyle = "rgba(255,180,180,0.95)";
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x - 10, p.y - 3);
+      ctx.stroke();
+    }
+  }
+}
+
+/* =========================
+   Enemy AI
+========================= */
+function runEnemyAI() {
+  const eCount = (type) => objects.filter(o => o.team === 'enemy' && o.typeKey === type && o.isAlive()).length;
+  const eBase = objects.find(o => o.team === 'enemy' && o.typeKey === 'HATCHERY' && o.isAlive());
+  if (!eBase) return;
+
+  // Drone 생산
+  if (eRes.min >= 50 && eCount('DRONE') < 10) {
+    eRes.min -= 50;
+    const d = new GameObject(eBase.x + rand(-40,40), eBase.y + rand(40,70), 'DRONE', 'enemy');
+    d.status = (eCount('DRONE') % 3 === 0) ? 'gassing' : 'mining';
+    objects.push(d);
+  }
+
+  // 전투 유닛 생산(30초 전에는 idle로만)
+  if (eRes.min >= 50 && eCount('ZERGLING') < 16) {
+    eRes.min -= 50;
+    const z = new GameObject(eBase.x + rand(-80,80), eBase.y + rand(-80,80), 'ZERGLING', 'enemy');
+    z.status = combatEnabled ? 'attacking' : 'idle';
+    objects.push(z);
+  }
+
+  if (eRes.min >= 100 && eRes.gas >= 50 && eCount('HYDRALISK') < 8) {
+    eRes.min -= 100; eRes.gas -= 50;
+    const h = new GameObject(eBase.x + rand(-100,100), eBase.y + rand(-100,100), 'HYDRALISK', 'enemy');
+    h.status = combatEnabled ? 'attacking' : 'idle';
+    objects.push(h);
+  }
+
+  if (eRes.min >= 150 && eRes.gas >= 100 && eCount('MUTALISK') < 4) {
+    eRes.min -= 150; eRes.gas -= 100;
+    const m = new GameObject(eBase.x + rand(-120,120), eBase.y + rand(-120,120), 'MUTALISK', 'enemy');
+    m.status = combatEnabled ? 'attacking' : 'idle';
+    objects.push(m);
+  }
+
+  if (combatEnabled) {
+    const attackers = eCount('ZERGLING') + eCount('HYDRALISK') + eCount('MUTALISK');
+    if (attackers >= 6) document.getElementById('msg').innerText = "경고: 저그 러시가 시작되었습니다!";
+  }
+}
+
+/* =========================
+   UI
+========================= */
+function initGame() {
+  objects.push(new GameObject(220, 220, 'COMMAND', 'player'));
+  for (let i=0; i<4; i++) {
+    const scv = new GameObject(240 + i*18, 290, 'SCV', 'player');
+    scv.status = 'mining';
+    objects.push(scv);
+  }
+
+  objects.push(new GameObject(canvas.width - 220, canvas.height - 220, 'HATCHERY', 'enemy'));
+  for (let i=0; i<4; i++) {
+    const dr = new GameObject(canvas.width - 240 - i*18, canvas.height - 290, 'DRONE', 'enemy');
+    dr.status = 'mining';
+    objects.push(dr);
+  }
+
+  setInterval(runEnemyAI, 2500);
+}
+
+function updateUI() {
+  document.getElementById('p-min').innerText = Math.floor(pRes.min);
+  document.getElementById('p-gas').innerText = Math.floor(pRes.gas);
+
+  const actions = document.getElementById('action-buttons');
+  const nameDisp = document.getElementById('sel-name');
+  actions.innerHTML = '';
+
+  if (!selectedObj || selectedObj.team !== 'player') {
+    nameDisp.innerText = "PLAYER VIEW";
+    document.getElementById('sel-hp').innerText = "";
+    document.getElementById('sel-status').innerText = "";
+    return;
+  }
+
+  nameDisp.innerText = selectedObj.data.name;
+  document.getElementById('sel-hp').innerText = `HP: ${selectedObj.hp} / ${selectedObj.data.hp}`;
+  document.getElementById('sel-status').innerText = `STATUS: ${selectedObj.status}`;
+
+  const menuMap = {
+    'COMMAND': [['Produce SCV', 'SCV']],
+    'SCV': [['Mine Mineral', 'MINE'], ['Extract Gas', 'GAS_EXT'], ['Barracks', 'BARRACKS'], ['Academy', 'ACADEMY'], ['Factory', 'FACTORY'], ['Starport', 'STARPORT']],
+    'BARRACKS': [['Marine', 'MARINE'], ['Firebat', 'FIREBAT'], ['Medic', 'MEDIC']],
+    'FACTORY': [['Siege Tank', 'SIEGE_TANK']],
+    'STARPORT': [['Battlecruiser', 'BATTLECRUISER']]
+  };
+
+  if (menuMap[selectedObj.typeKey]) {
+    menuMap[selectedObj.typeKey].forEach(([label, id]) => {
+      const btn = document.createElement('button');
+      const d = DATA[id];
+      btn.innerHTML = d ? `${label}<br><small>M:${d.cost[0]} G:${d.cost[1]}</small>` : label;
+
+      let reqMet = !d || !d.req || objects.some(o => o.team === 'player' && o.typeKey === d.req && o.isAlive());
+      btn.disabled = !reqMet || (d && (pRes.min < d.cost[0] || pRes.gas < d.cost[1]));
+
+      btn.onclick = () => {
+        if (id === 'MINE') selectedObj.status = 'mining';
+        else if (id === 'GAS_EXT') selectedObj.status = 'gassing';
+        else {
+          pRes.min -= d.cost[0]; pRes.gas -= d.cost[1];
+          const nx = selectedObj.x + (Math.random()*150 - 75);
+          const ny = selectedObj.y + (Math.random()*150 - 75);
+          const nu = new GameObject(nx, ny, id, 'player');
+          if (nu.isCombatUnit()) nu.status = 'attacking';
+          objects.push(nu);
+        }
+        updateUI();
+      };
+      actions.appendChild(btn);
+    });
+
+    if (selectedObj.isCombatUnit()) {
+      const btn = document.createElement('button');
+      btn.innerHTML = `Attack Mode<br><small>Auto Combat</small>`;
+      btn.disabled = false;
+      btn.onclick = () => {
+        selectedObj.status = (selectedObj.status === 'attacking') ? 'idle' : 'attacking';
+        updateUI();
+      };
+      actions.appendChild(btn);
+    }
+  }
+}
+
+function drawResources() {
+  const drawRes = (x, y, color, label) => {
+    ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x, y, 25, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = "10px Arial"; ctx.fillText(label, x-20, y-30);
+  };
+  drawRes(80, 80, '#50bcdf', "MINERAL");
+  drawRes(80, 350, '#2ecc71', "VESPENE");
+  drawRes(canvas.width-80, canvas.height-80, '#50bcdf', "MINERAL");
+  drawRes(canvas.width-80, canvas.height-350, '#2ecc71', "VESPENE");
+}
+
+function cleanupDead() {
+  for (let i=objects.length-1;i>=0;i--){
+    if (!objects[i].isAlive()) objects.splice(i,1);
+  }
+  if (selectedObj && !selectedObj.isAlive()) {
+    selectedObj = null;
+    updateUI();
+  }
+}
+
+/* =========================
+   Main Loop
+========================= */
+function gameLoop() {
+  ctx.fillStyle = '#0a0d10';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // ✅ 30초 이후 공격 허용
+  if (!combatEnabled && performance.now() - gameStartTime >= 30000) {
+    combatEnabled = true;
+    document.getElementById('msg').innerText = "⚠️ 저그가 공격을 개시했습니다!";
+  }
+
+  drawResources();
+
+  for (const obj of objects) obj.update();
+  updateProjectiles();
+
+  for (const obj of objects) obj.draw();
+  drawProjectiles();
+
+  cleanupDead();
+  requestAnimationFrame(gameLoop);
+}
+
+/* =========================
+   Input (Select / Move / Attack)
+========================= */
+canvas.addEventListener('mousedown', (e) => {
+  // ✅ 캔버스 top=40이므로 y 보정
+  const mx = e.clientX;
+  const my = e.clientY - TOP_UI;
+  if (my < 0 || my > canvas.height) return;
+
+  if (e.button === 0) {
+    selectedObj = null;
+    for (let i=objects.length-1;i>=0;i--){
+      const o = objects[i];
+      const hit = Math.hypot(o.x-mx, o.y-my) < (o.data.size + 10);
+      if (hit) { selectedObj = o; break; }
+    }
+    updateUI();
+  } else if (selectedObj && selectedObj.team === 'player' && selectedObj.data.speed) {
+    const target = objects.find(o => o.team === 'enemy' && o.isAlive() && Math.hypot(o.x-mx, o.y-my) < (o.data.size + 10));
+    if (target && selectedObj.isCombatUnit()) {
+      // ✅ 공격 명령: attacking로 두고, 이동 명령 좌표 영향 제거(선택)
+      selectedObj.attackTarget = target;
+      selectedObj.status = 'attacking';
+      // (선택) 이동 좌표를 현재 위치로 고정해두면 "이동 로직"이 끼어들 여지가 더 줄어듦
+      selectedObj.targetX = selectedObj.x;
+      selectedObj.targetY = selectedObj.y;
+
+      document.getElementById('msg').innerText = "테란 유닛이 공격 명령을 받았습니다!";
+      updateUI();
+    } else {
+      // ✅ 이동 명령: moving로 전환 + 공격 타겟 해제
+      selectedObj.attackTarget = null;
+      selectedObj.targetX = mx;
+      selectedObj.targetY = my;
+      selectedObj.status = 'moving';
+      selectedObj.cargo = 0;
+      updateUI();
+    }
+  }
+});
+canvas.oncontextmenu = (e) => e.preventDefault();
+
+/* =========================
+   Start
+========================= */
+initGame();
+updateUI();
+gameLoop();
+</script>
+</body>
+</html>
